@@ -2,6 +2,20 @@
 
 All notable changes to this project. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `claude-acct doctor [--fix]` — diagnoses install (deps, permissions, layout, PATH) and optionally auto-recovers from common breakages.
+- Self-healing: `use`, `switch`, `add`, and `init` detect when Claude Code has rewritten `~/.claude/.credentials.json` as a regular file (token refresh) and re-absorb the fresh credentials into the active account's JSON file before doing anything else. Previously this would silently discard the refresh on next switch.
+- `install.sh` for one-liner installation: `curl -fsSL .../install.sh | bash`. Idempotent: re-running pulls the latest changes.
+- macOS support for `claude-acct` (`claudex` remains Linux-only). CI matrix runs both `ubuntu-latest` and `macos-latest`.
+
+### Changed
+- `claude-acct` no longer uses `mapfile` or GNU `date -d` directly — both are wrapped in portability helpers (`to_epoch`, `format_epoch`, `read_lines_into`) so the script runs on macOS bash 3.2 + BSD date.
+
+### Documentation
+- README: install one-liner, troubleshooting section covering the symlink-rewrite case and `doctor --fix`, honest platform matrix, explicit note about pattern-matching fragility.
+
 ## [0.1.0] - 2026-05-05
 
 First tagged release.

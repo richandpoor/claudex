@@ -39,18 +39,61 @@ ok()   { echo "${C_GREEN}✓${C_RESET} $*"; }
 # ever used a single account, ~/.claude/.credentials.json is a regular file
 # and needs to be migrated into accounts/ (see README "Bootstrap").
 ensure_setup() {
-  [[ -d "$ACCT_DIR" ]] || die "accounts dir missing: $ACCT_DIR — run bootstrap first (see README)"
+  [[ -d "$ACCT_DIR" ]] || die "accounts dir missing: $ACCT_DIR — run 'claude-acct init <name>'"
   [[ -f "$ACTIVE_FILE" ]] || die "'active' file missing in $ACCT_DIR"
+  # If Claude rewrote the symlink as a regular file (token refresh), try to
+  # heal silently. ensure_setup must remain a hard gate against unrecoverable
+  # state — but a healable state isn't unrecoverable.
+  [[ -L "$CRED_LINK" ]] || heal_credentials_link
   if [[ ! -L "$CRED_LINK" ]]; then
-    die "$CRED_LINK is not a symlink. To recover:
-  mv $CRED_LINK $ACCT_DIR/<name>.json
-  ln -s accounts/<name>.json $CRED_LINK
-  echo <name> > $ACTIVE_FILE"
+    die "$CRED_LINK is not a symlink and could not be auto-healed. To recover:
+  claude-acct doctor --fix"
   fi
 }
 
 current_active() {
   cat "$ACTIVE_FILE" 2>/dev/null | tr -d '[:space:]'
+}
+
+# ─── Portability helpers ────────────────────────────────────────────────
+# We support GNU date (Linux) and BSD date (macOS). The script uses two
+# operations: parse a string into unix epoch, and format an epoch into a
+# human-readable timestamp. Neither has a single portable form, so each
+# helper tries the GNU variant first and falls back to BSD.
+
+# Parse "string|epoch" → unix epoch on stdout. Returns 1 if unparseable.
+to_epoch() {
+  local s="$1"
+  [[ -n "$s" ]] || return 1
+  if [[ "$s" =~ ^[0-9]+$ ]]; then printf '%s\n' "$s"; return 0; fi
+  date -d "$s" +%s 2>/dev/null && return 0
+  # BSD date: try a few common formats. Order matters — most-specific first.
+  local fmt
+  for fmt in "%Y-%m-%d %H:%M:%S" "%Y-%m-%d %H:%M" "%Y-%m-%dT%H:%M:%S" "%Y-%m-%d"; do
+    date -j -f "$fmt" "$s" +%s 2>/dev/null && return 0
+  done
+  # BSD date relative form ("+3 hours") differs from GNU; we accept defeat.
+  return 1
+}
+
+# Format a unix epoch as "YYYY-MM-DD HH:MM:SS %z".
+format_epoch() {
+  local ts="$1"
+  date -d "@$ts" '+%Y-%m-%d %H:%M:%S %z' 2>/dev/null && return 0
+  date -r "$ts" '+%Y-%m-%d %H:%M:%S %z' 2>/dev/null && return 0
+  printf '%s\n' "$ts"
+}
+
+# Portable replacement for `mapfile -t arr < <(cmd)`. Reads stdin lines into
+# the named array variable. macOS ships bash 3.2 by default, which lacks
+# mapfile.
+read_lines_into() {
+  local _name="$1"
+  eval "$_name=()"
+  local _line
+  while IFS= read -r _line; do
+    eval "$_name+=(\"\$_line\")"
+  done
 }
 
 list_accounts() {
@@ -125,7 +168,7 @@ account_reset_plain() {
   if [[ -f "$rf" ]]; then
     ts=$(cat "$rf" 2>/dev/null | tr -d '[:space:]')
     if ! [[ "$ts" =~ ^[0-9]+$ ]]; then
-      parsed=$(date -d "$ts" +%s 2>/dev/null) || parsed=""
+      parsed=$(to_epoch "$ts") || parsed=""
       ts="${parsed:-}"
     fi
     if [[ -n "$ts" ]] && [[ "$ts" =~ ^[0-9]+$ ]]; then
@@ -294,11 +337,31 @@ cmd_status() {
   fi
 }
 
+# Defensive heal: if Claude Code has refreshed its OAuth token by rewriting
+# ~/.claude/.credentials.json directly (replacing our symlink with a regular
+# file), preserve the fresh tokens by moving them into the active account's
+# JSON file before we do anything else. Without this, every switch would
+# discard whatever token refresh happened since the last switch.
+heal_credentials_link() {
+  [[ -f "$ACTIVE_FILE" ]] || return 0
+  [[ -e "$CRED_LINK" ]] || return 0
+  [[ -L "$CRED_LINK" ]] && return 0
+  local active
+  active=$(current_active)
+  [[ -n "$active" ]] || return 0
+  [[ -f "$ACCT_DIR/$active.json" ]] || return 0
+  mv -f "$CRED_LINK" "$ACCT_DIR/$active.json"
+  chmod 600 "$ACCT_DIR/$active.json"
+  ln -s "accounts/$active.json" "$CRED_LINK"
+  echo "${C_DIM}↺ healed: claude had rewritten .credentials.json; re-absorbed into $active.json${C_RESET}" >&2
+}
+
 cmd_use() {
   ensure_setup
   local target="${1:-}"
   [[ -n "$target" ]] || die "usage: claude-acct use <name>"
   [[ -f "$ACCT_DIR/$target.json" ]] || die "account '$target' does not exist. List: claude-acct list"
+  heal_credentials_link
   local current
   current=$(current_active)
   if [[ "$current" == "$target" ]]; then
@@ -321,7 +384,7 @@ account_is_rate_limited() {
   if [[ -f "$rf" ]]; then
     ts=$(tr -d '[:space:]' < "$rf" 2>/dev/null)
     if ! [[ "$ts" =~ ^[0-9]+$ ]]; then
-      ts=$(date -d "$ts" +%s 2>/dev/null) || ts=""
+      ts=$(to_epoch "$ts") || ts=""
     fi
     [[ -n "$ts" ]] && [[ "$ts" =~ ^[0-9]+$ ]] && (( ts > now )) && return 0
   fi
@@ -347,7 +410,7 @@ cmd_switch() {
     return
   fi
   local accounts current next
-  mapfile -t accounts < <(list_accounts)
+  read_lines_into accounts < <(list_accounts)
   (( ${#accounts[@]} >= 2 )) || die "switch requires at least 2 accounts (you have ${#accounts[@]})"
   current=$(current_active)
   local n=${#accounts[@]} i found=-1
@@ -540,14 +603,12 @@ cmd_set_reset_at() {
     claude-acct set-reset-at A '2026-05-04 20:30:00'
     claude-acct set-reset-at B '+3 hours 39 minutes'"
   [[ -f "$ACCT_DIR/$name.json" ]] || die "unknown account '$name'"
-  if [[ "$arg" =~ ^[0-9]+$ ]]; then
-    ts="$arg"
-  else
-    ts=$(date -d "$arg" +%s) || die "could not parse time (GNU date): $arg"
-  fi
+  ts=$(to_epoch "$arg") || die "could not parse time: $arg
+  Try one of: '2026-05-04 20:30:00', '1746391800' (epoch). On Linux you may
+  also use GNU date relative forms like '+3 hours 39 minutes'."
   echo "$ts" > "$ACCT_DIR/$name.reset-at"
   chmod 600 "$ACCT_DIR/$name.reset-at"
-  ok "wall reset for '${C_BOLD}$name${C_RESET}' → $(date -d "@$ts" '+%Y-%m-%d %H:%M:%S %z')"
+  ok "wall reset for '${C_BOLD}$name${C_RESET}' → $(format_epoch "$ts")"
 }
 
 cmd_refresh_info() {
@@ -556,7 +617,7 @@ cmd_refresh_info() {
   if [[ "${1:-}" == "--force" ]]; then force=1; fi
   _RESTORE_ACTIVE=$(current_active)
   local accounts done_any=0
-  mapfile -t accounts < <(list_accounts)
+  read_lines_into accounts < <(list_accounts)
   trap 'restore_active_account; exit 130' INT TERM
   for name in "${accounts[@]}"; do
     if [[ -f "$ACCT_DIR/$name.email" ]] && (( ! force )); then
@@ -584,6 +645,130 @@ cmd_refresh_info() {
   fi
 }
 
+# Diagnose the install. Reports actionable issues; exit code 0 if everything
+# looks healthy, 1 if any problem was found. Safe to run anytime.
+#
+# With --fix: recover from the most common breakage — Claude Code refreshing
+# its OAuth token by rewriting ~/.claude/.credentials.json directly, which
+# replaces our symlink with a regular file containing the fresh credentials.
+# We move that file back into accounts/<active>.json (preserving the fresh
+# tokens) and recreate the symlink. Idempotent.
+cmd_doctor() {
+  local fix=0
+  [[ "${1:-}" == "--fix" ]] && fix=1
+  local issues=0
+  local C_OK=$'\e[32m✓\e[0m' C_WARN=$'\e[33m⚠\e[0m' C_ERR=$'\e[31m✗\e[0m'
+  [[ -t 1 ]] || { C_OK='[ok]'; C_WARN='[warn]'; C_ERR='[FAIL]'; }
+  _ok()   { echo "  $C_OK $*"; }
+  _warn() { echo "  $C_WARN $*"; }
+  _err()  { echo "  $C_ERR $*"; issues=$((issues + 1)); }
+
+  echo "${C_BOLD}claude-acct doctor${C_RESET}"
+  echo
+  echo "Environment:"
+  if (( BASH_VERSINFO[0] >= 4 )); then
+    _ok "bash ${BASH_VERSION%%(*}"
+  else
+    _warn "bash ${BASH_VERSION%%(*} (need 4+; macOS ships 3.2 — install via brew)"
+  fi
+  local cmd
+  for cmd in claude python3 ln mv chmod cat tr grep find date stat; do
+    if command -v "$cmd" &>/dev/null; then
+      _ok "$cmd present"
+    else
+      _err "$cmd missing on PATH (required)"
+    fi
+  done
+  for cmd in flock notify-send script; do
+    if command -v "$cmd" &>/dev/null; then
+      _ok "$cmd present (optional, used by claudex)"
+    else
+      _warn "$cmd missing (optional — claudex degrades gracefully)"
+    fi
+  done
+
+  echo
+  echo "Layout:"
+  if [[ -d "$ACCT_DIR" ]]; then
+    _ok "$ACCT_DIR exists"
+  else
+    _err "$ACCT_DIR missing — run 'claude-acct init <name>'"
+    echo
+    echo "${C_RED}$issues issue(s) found.${C_RESET}"
+    return 1
+  fi
+  if [[ -L "$CRED_LINK" ]]; then
+    local target
+    target=$(readlink "$CRED_LINK")
+    if [[ -f "$ACCT_DIR/$(basename "$target")" ]]; then
+      _ok "$CRED_LINK → $target (target exists)"
+    else
+      _err "$CRED_LINK → $target (target file MISSING)"
+    fi
+  elif [[ -f "$CRED_LINK" ]]; then
+    if (( fix )) && [[ -f "$ACTIVE_FILE" ]]; then
+      local active backup
+      active=$(current_active)
+      if [[ -n "$active" ]] && [[ -f "$ACCT_DIR/$active.json" ]]; then
+        backup="$ACCT_DIR/$active.json.before-fix.$$"
+        _warn "$CRED_LINK is a regular file (Claude rewrote it on token refresh); recovering"
+        cp "$ACCT_DIR/$active.json" "$backup"
+        mv -f "$CRED_LINK" "$ACCT_DIR/$active.json"
+        chmod 600 "$ACCT_DIR/$active.json"
+        ln -s "accounts/$active.json" "$CRED_LINK"
+        _ok "moved fresh credentials into $active.json (previous saved as $(basename "$backup"))"
+        _ok "recreated symlink $CRED_LINK → accounts/$active.json"
+      else
+        _err "$CRED_LINK is a regular file but active account is unknown — cannot auto-fix"
+      fi
+    else
+      _err "$CRED_LINK is a regular file, not a symlink — run 'claude-acct doctor --fix' to recover"
+    fi
+  else
+    _err "$CRED_LINK does not exist"
+  fi
+  if [[ -f "$ACTIVE_FILE" ]]; then
+    local active perms
+    active=$(current_active)
+    _ok "active account: $active"
+  else
+    _err "$ACTIVE_FILE missing"
+  fi
+
+  echo
+  echo "Account files:"
+  local name perms count=0
+  for name in $(list_accounts); do
+    count=$((count + 1))
+    perms=$(stat -c '%a' "$ACCT_DIR/$name.json" 2>/dev/null \
+      || stat -f '%OLp' "$ACCT_DIR/$name.json" 2>/dev/null)
+    if [[ "$perms" == "600" ]]; then
+      _ok "$name.json (chmod 600)"
+    else
+      _err "$name.json has perms $perms — should be 600 (run: chmod 600 $ACCT_DIR/$name.json)"
+    fi
+  done
+  (( count > 0 )) || _err "no accounts configured under $ACCT_DIR"
+
+  echo
+  echo "PATH:"
+  for cmd in claude-acct claudex; do
+    if command -v "$cmd" &>/dev/null; then
+      _ok "$cmd → $(command -v "$cmd")"
+    else
+      _warn "$cmd not on PATH (won't break claude-acct itself, but claudex needs claude-acct on PATH or co-located)"
+    fi
+  done
+
+  echo
+  if (( issues == 0 )); then
+    echo "${C_GREEN}all checks passed.${C_RESET}"
+    return 0
+  fi
+  echo "${C_RED}$issues issue(s) found.${C_RESET}"
+  return 1
+}
+
 cmd_help() {
   cat <<'EOF'
 claude-acct — multi-account manager for Claude Code
@@ -604,7 +789,9 @@ USAGE
                                      (briefly switches each one, then restores)
   claude-acct set-email <name> <addr> Pin mailbox label when auth status can't switch cleanly
   claude-acct set-reset-at <n> <t>   Wall-clock extra-usage reset for list display
-                                     (<t> = unix epoch, or string for GNU date -d)
+                                     (<t> = epoch, '2026-05-04 20:30:00', or
+                                     GNU date relative form on Linux)
+  claude-acct doctor                 Diagnose the install (PATH, perms, deps, layout)
   claude-acct help                   This help
 
 FILES
@@ -624,6 +811,7 @@ shift || true
 
 case "$cmd" in
   init)                 cmd_init "$@" ;;
+  doctor)               cmd_doctor "$@" ;;
   list|ls)              cmd_list "$@" ;;
   status|st)            cmd_status "$@" ;;
   use)                  cmd_use "$@" ;;

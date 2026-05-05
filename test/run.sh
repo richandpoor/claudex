@@ -12,4 +12,8 @@ if [[ ! -x "$bats_root/bin/bats" ]]; then
   git clone --depth=1 --quiet https://github.com/bats-core/bats-core.git "$bats_root"
 fi
 
-exec "$bats_root/bin/bats" "$here/claude-acct.bats" "$here/patterns.bats" "$@"
+# Default: run every *.bats under test/. Pass explicit paths to override.
+if (( $# > 0 )); then
+  exec "$bats_root/bin/bats" "$@"
+fi
+exec "$bats_root/bin/bats" "$here"/*.bats

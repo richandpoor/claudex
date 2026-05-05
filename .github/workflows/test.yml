@@ -7,10 +7,23 @@ on:
 
 jobs:
   bats:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: bash syntax check
         run: bash -n bin/claude-acct && bash -n bin/claudex
-      - name: bats
-        run: test/run.sh
+      - name: install bash 4+ on macOS
+        if: matrix.os == 'macos-latest'
+        run: brew install bash
+      - name: bats (claude-acct only on macOS; claudex stays Linux-only)
+        run: |
+          if [ "${{ matrix.os }}" = 'macos-latest' ]; then
+            # Run only the portable claude-acct tests on macOS.
+            test/run.sh test/claude-acct.bats
+          else
+            test/run.sh
+          fi

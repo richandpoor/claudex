@@ -21,24 +21,37 @@ No daemons, no config file. State lives in plain files under `~/.claude/accounts
 - `flock` (used to serialize concurrent auto-switches in claudex)
 - Optional: `notify-send` for desktop notifications
 
-**Linux only at the moment.** macOS is not supported — `script(1)` has different
-argument order on BSD, the default bash 3.2 lacks `mapfile`, BSD `date` doesn't
-take `-d`, and `flock` isn't installed by default. Patches welcome.
+**Platform support:**
+
+- **Linux**: both tools fully supported and tested in CI.
+- **macOS**: `claude-acct` works (CI runs the full claude-acct testsuite on `macos-latest`). `claudex` is Linux-only — `script(1)` argument order differs on BSD and `flock` isn't installed by default. Use `claude-acct` standalone or run `claudex` inside a Linux VM/container.
+- **Windows**: not supported. WSL2 should work like Linux (untested).
 
 ## Install
 
-Clone the repo and symlink both scripts onto your `PATH`:
+One-liner (clones into `~/.local/share/claudex` and symlinks both binaries into `~/.local/bin`):
 
 ```sh
-git clone https://github.com/<your-fork>/claudex.git
-cd claudex
-ln -sf "$PWD/bin/claude-acct" ~/.local/bin/claude-acct
-ln -sf "$PWD/bin/claudex"     ~/.local/bin/claudex
+curl -fsSL https://raw.githubusercontent.com/richandpoor/claudex/main/install.sh | bash
 ```
 
-**Symlinks are recommended.** `claudex` resolves its own path to find the repo root and writes session recordings to `<repo>/claudex-logs/`. A copied binary loses that anchor and would log next to the install dir instead, so prefer `ln -sf` over `install`/`cp`.
+Re-running the installer pulls the latest changes. Override `CLAUDEX_HOME` and `CLAUDEX_BIN` to install elsewhere.
 
-`claudex` looks for `claude-acct` on `PATH` first, then in the same directory as itself, so co-located installs work even without `PATH`.
+Manual alternative:
+
+```sh
+git clone https://github.com/richandpoor/claudex.git ~/.local/share/claudex
+ln -sf ~/.local/share/claudex/bin/claude-acct ~/.local/bin/claude-acct
+ln -sf ~/.local/share/claudex/bin/claudex     ~/.local/bin/claudex
+```
+
+**Symlinks are required for `claudex`** (not for `claude-acct`). `claudex` resolves its own path to find the repo root and writes session recordings to `<repo>/claudex-logs/`. A copied binary loses that anchor.
+
+After install, verify the environment:
+
+```sh
+claude-acct doctor
+```
 
 ## Bootstrap (one-time)
 
@@ -73,6 +86,8 @@ claude-acct mark-limit [<name>] # record a rate-limit timestamp now
 claude-acct refresh-info [--force]  # repopulate cached emails for every account
 claude-acct set-email <name> <addr> # pin the displayed email when auth status can't switch cleanly
 claude-acct set-reset-at <name> <t> # wall-clock reset for the list display
+claude-acct doctor              # diagnose install: PATH, perms, deps, layout
+claude-acct doctor --fix        # also auto-recover common breakages
 claude-acct help
 ```
 
@@ -133,12 +148,42 @@ A `flock`-protected critical section ensures two concurrent `claudex` sessions d
 
 Every per-account file is `chmod 600` and named after the account. Removing an account deletes all its sidecar files in one go.
 
+## Troubleshooting
+
+Run `claude-acct doctor` first — it covers most issues with a one-line diagnosis.
+
+### `~/.claude/.credentials.json is a regular file, not a symlink`
+
+Claude Code occasionally rewrites this path directly when it refreshes its OAuth token, replacing our symlink with a regular file containing the fresh credentials. `claude-acct` detects this on every state-changing operation (`use`, `switch`, `add`, `init`) and self-heals by re-absorbing the fresh credentials into the active account's JSON file. If you want to heal proactively without changing accounts:
+
+```sh
+claude-acct doctor --fix
+```
+
+If the fresh credentials are valuable (recent token refresh), the heal preserves them — the active account's old JSON is saved as `<name>.json.before-fix.<pid>` for one-revert safety.
+
+### `Active account` shows the wrong email in `claude-acct list`
+
+After a symlink swap, `claude auth status` may keep returning the previous identity for a few requests. Pin the displayed email manually:
+
+```sh
+claude-acct set-email <name> you@domain.tld
+```
+
+### `switch requires at least 2 accounts`
+
+You only have one account configured. Add a second:
+
+```sh
+claude-acct add <name>
+```
+
 ## Notes and caveats
 
-- **`claude auth status` cache.** Native Claude sometimes keeps reporting the previous identity after the symlink is repointed. `claude-acct` works around this when populating cached emails, but if you see the wrong email in `list`, pin it explicitly with `set-email`.
 - **Reset estimate.** Without `<name>.reset-at`, the listing falls back to a 5-hour sliding window from the last `mark-limit`. This is an estimate and often differs from the real reset shown by Claude `/extra-usage`. Use `set-reset-at` for a wall-clock value.
 - **Per-account limits, shared models.** Switching accounts gives you a fresh quota on a different OAuth identity; it does not bypass any per-organization limit imposed by Anthropic.
 - **No support for API keys.** This tool is OAuth-only (Claude Pro/Max). Setting `ANTHROPIC_API_KEY` in the environment bypasses both the credentials file and Remote Control.
+- **Pattern matching is fundamentally fragile.** `claudex` detects rate-limits by grepping the session log for phrases Claude Code emits. If Anthropic changes the wording in a future release, auto-switch will silently stop firing until `LIMIT_PATTERNS` and `test/fixtures/` are updated. The fixture-based test under `test/patterns.bats` documents the current set; PRs adding new fixtures are welcome.
 
 ## Tests
 

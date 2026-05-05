@@ -48,3 +48,8 @@ active_target() {
 active_file_contents() {
   tr -d '[:space:]' < "$HOME/.claude/accounts/active"
 }
+
+# Portable file-permission read (GNU stat first, BSD stat fallback).
+file_perms() {
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%OLp' "$1" 2>/dev/null
+}

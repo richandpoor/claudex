@@ -53,7 +53,7 @@ load test_helper
   run "$CLAUDE_ACCT_BIN" set-email B foo@bar.test
   [ "$status" -eq 0 ]
   [ "$(cat "$HOME/.claude/accounts/B.email")" = "foo@bar.test" ]
-  perms=$(stat -c '%a' "$HOME/.claude/accounts/B.email")
+  perms=$(file_perms "$HOME/.claude/accounts/B.email")
   [ "$perms" = "600" ]
 }
 
@@ -127,7 +127,7 @@ JSON
   [ "$(active_target)" = "main.json" ]
   [ "$(active_file_contents)" = "main" ]
   [ -f "$HOME/.claude/accounts/main.json" ]
-  perms=$(stat -c '%a' "$HOME/.claude/accounts/main.json")
+  perms=$(file_perms "$HOME/.claude/accounts/main.json")
   [ "$perms" = "600" ]
 }
 
@@ -150,6 +150,35 @@ assert names == ['A', 'B'], names
 active = [a for a in d['accounts'] if a['active']]
 assert len(active) == 1 and active[0]['name'] == 'A', active
 "
+}
+
+@test "heal: ensure_setup recovers when claude rewrote .credentials.json as a regular file" {
+  # Simulate claude doing a token refresh: replace symlink with regular file
+  # whose content represents the freshly-refreshed credentials.
+  rm "$HOME/.claude/.credentials.json"
+  echo '{"claudeAiOauth":{"accessToken":"REFRESHED","subscriptionType":"max20"}}' \
+    > "$HOME/.claude/.credentials.json"
+  run "$CLAUDE_ACCT_BIN" list
+  [ "$status" -eq 0 ]
+  # After the heal, the symlink is back and accounts/A.json has the fresh token.
+  [ -L "$HOME/.claude/.credentials.json" ]
+  [ "$(active_target)" = "A.json" ]
+  grep -q REFRESHED "$HOME/.claude/accounts/A.json"
+}
+
+@test "doctor reports a healthy install" {
+  run "$CLAUDE_ACCT_BIN" doctor
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"all checks passed"* ]]
+}
+
+@test "doctor --fix recovers a regular-file credentials.json" {
+  rm "$HOME/.claude/.credentials.json"
+  echo '{"claudeAiOauth":{"accessToken":"FRESH"}}' > "$HOME/.claude/.credentials.json"
+  run "$CLAUDE_ACCT_BIN" doctor --fix
+  [ "$status" -eq 0 ]
+  [ -L "$HOME/.claude/.credentials.json" ]
+  grep -q FRESH "$HOME/.claude/accounts/A.json"
 }
 
 @test "list --json marks recently rate-limited accounts" {
