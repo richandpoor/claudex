@@ -2,7 +2,7 @@
 
 All notable changes to this project. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] - 2026-05-05
 
 ### Added
 - `claude-acct doctor [--fix]` — diagnoses install (deps, permissions, layout, PATH) and optionally auto-recovers from common breakages.
