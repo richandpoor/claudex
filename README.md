@@ -1,5 +1,7 @@
 # claudex
 
+[![test](https://github.com/richandpoor/claudex/actions/workflows/test.yml/badge.svg)](https://github.com/richandpoor/claudex/actions/workflows/test.yml)
+
 Multi-account manager and rate-limit-aware wrapper for [Claude Code](https://docs.claude.com/claude-code).
 
 Two small Bash tools that let you keep several Claude Pro/Max OAuth sessions side by side, switch between them with one command, and have your `claude` session automatically continue on a different account when the active one hits the 5-hour usage limit.
@@ -13,11 +15,15 @@ No daemons, no config file. State lives in plain files under `~/.claude/accounts
 
 - Bash 4+
 - `claude` (Claude Code CLI) on `PATH`
-- `script` (from `bsdmainutils` / `util-linux`)
+- `script` from `util-linux` (the Linux flavor — argument order differs from BSD)
 - `python3` (used to parse OAuth JSON for the listing)
-- Optional: `notify-send` for desktop alerts, `flock` for the switch lock
+- GNU `date` (used by `set-reset-at` to parse `'+3 hours'` and similar strings)
+- `flock` (used to serialize concurrent auto-switches in claudex)
+- Optional: `notify-send` for desktop notifications
 
-Linux and macOS are supported. Tested mostly on Linux.
+**Linux only at the moment.** macOS is not supported — `script(1)` has different
+argument order on BSD, the default bash 3.2 lacks `mapfile`, BSD `date` doesn't
+take `-d`, and `flock` isn't installed by default. Patches welcome.
 
 ## Install
 

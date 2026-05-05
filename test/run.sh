@@ -12,4 +12,4 @@ if [[ ! -x "$bats_root/bin/bats" ]]; then
   git clone --depth=1 --quiet https://github.com/bats-core/bats-core.git "$bats_root"
 fi
 
-exec "$bats_root/bin/bats" "$here/claude-acct.bats" "$@"
+exec "$bats_root/bin/bats" "$here/claude-acct.bats" "$here/patterns.bats" "$@"
