@@ -24,7 +24,20 @@
 
 set -uo pipefail
 
-readonly LOG_DIR="$HOME/.claude/claudex-logs"
+# Resolve the real location of this script (following any symlinks) so that
+# claudex-logs/ always lives inside the claudex repo — not under ~/.claude/.
+# Layout assumed: <project>/bin/claudex → logs at <project>/claudex-logs/.
+_self="${BASH_SOURCE[0]}"
+while [[ -L "$_self" ]]; do
+  _link=$(readlink "$_self")
+  if [[ "$_link" = /* ]]; then
+    _self="$_link"
+  else
+    _self="$(dirname "$_self")/$_link"
+  fi
+done
+readonly CLAUDEX_ROOT="$(cd "$(dirname "$_self")/.." && pwd)"
+readonly LOG_DIR="$CLAUDEX_ROOT/claudex-logs"
 readonly LOCK_FILE="$HOME/.claude/.claudex.switch.lock"
 readonly LOG_RETENTION_DAYS=30
 # Number of trailing lines we look at to confirm the rate-limit at end of run.

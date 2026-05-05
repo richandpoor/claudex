@@ -21,20 +21,16 @@ Linux and macOS are supported. Tested mostly on Linux.
 
 ## Install
 
-Clone the repo and put both scripts on your `PATH`:
+Clone the repo and symlink both scripts onto your `PATH`:
 
 ```sh
 git clone https://github.com/<your-fork>/claudex.git
 cd claudex
-install -m 755 bin/claude-acct bin/claudex ~/.local/bin/
-```
-
-Or symlink them in place if you prefer to track upstream:
-
-```sh
 ln -sf "$PWD/bin/claude-acct" ~/.local/bin/claude-acct
 ln -sf "$PWD/bin/claudex"     ~/.local/bin/claudex
 ```
+
+**Symlinks are recommended.** `claudex` resolves its own path to find the repo root and writes session recordings to `<repo>/claudex-logs/`. A copied binary loses that anchor and would log next to the install dir instead, so prefer `ln -sf` over `install`/`cp`.
 
 `claudex` looks for `claude-acct` on `PATH` first, then in the same directory as itself, so co-located installs work even without `PATH`.
 
@@ -90,7 +86,7 @@ claudex -p "do X"      # one-shot prompt
 
 What it adds:
 
-- Tees the session through `script(1)` into `~/.claude/claudex-logs/<timestamp>.cycleN.log`
+- Tees the session through `script(1)` into `<repo>/claudex-logs/<timestamp>.cycleN.log`
 - Tails the log live; on the first match of a rate-limit pattern, alerts via terminal bell + `notify-send` + a yellow on-screen banner
 - When `claude` exits, re-checks the last 80 log lines to confirm the match, then runs `claude-acct switch` and re-launches `claude --continue` on the next account
 - Logs older than 30 days are deleted on startup
@@ -117,13 +113,16 @@ A `flock`-protected critical section ensures two concurrent `claudex` sessions d
 ```
 ~/.claude/
 ├── .credentials.json           → symlink to accounts/<active>.json
-├── claudex-logs/               # per-cycle session recordings (auto-rotated, 30 days)
+├── .claudex.switch.lock        # flock target for the auto-switch critical section
 └── accounts/
     ├── active                  # one-line file: name of the active account
     ├── <name>.json             # OAuth credentials, chmod 600
     ├── <name>.email            # cached email for the listing (optional)
     ├── <name>.last-limit       # epoch timestamp of last detected rate-limit
     └── <name>.reset-at         # optional wall-clock reset (epoch or date string)
+
+<repo>/
+└── claudex-logs/               # per-cycle session recordings (auto-rotated, 30 days)
 ```
 
 Every per-account file is `chmod 600` and named after the account. Removing an account deletes all its sidecar files in one go.
