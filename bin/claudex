@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+# claudex — Claude Code wrapper with auto-switch on rate-limit.
+#
+# Runs `claude "$@"` while recording its output via script(1) (preserves the
+# TTY). A background watcher tails the log and, the moment it spots a
+# rate-limit pattern, alerts the user with a terminal bell + notify-send +
+# a prominent on-screen message. When claude exits, the wrapper confirms
+# the match (looking only at the last N lines of the log) and — if confirmed
+# and at least 2 accounts are configured — switches account and re-runs
+# `claude --continue` to resume the conversation seamlessly.
+#
+# Usage: drop-in replacement for `claude`:
+#   claudex
+#   claudex -c
+#   claudex -p "do X"
+#
+# By default claudex passes --remote-control so the session is reachable from
+# claude.ai/code and the mobile app (see Claude Code docs). Disabled for -p/--print.
+#
+# claudex-only flags (stripped before forwarding to claude):
+#   --no-auto-switch     disable the post-exit switch
+#   --no-watch           disable the live tail watcher (rely on end check only)
+#   --no-remote-control  do not pass --remote-control to claude
+
+set -uo pipefail
+
+readonly LOG_DIR="$HOME/.claude/claudex-logs"
+readonly LOCK_FILE="$HOME/.claude/.claudex.switch.lock"
+readonly LOG_RETENTION_DAYS=30
+# Number of trailing lines we look at to confirm the rate-limit at end of run.
+# Keeps false positives down (the words "rate limit" can appear in unrelated
+# task output without indicating an actual limit).
+readonly TAIL_LINES=80
+
+mkdir -p "$LOG_DIR"
+
+# Patterns indicating Claude Pro/Max rate-limit. Explicit list to avoid
+# matching on generic words like "limit". All matched case-insensitively.
+readonly LIMIT_PATTERNS=(
+  'rate.?limit'
+  'rate-limit-options'
+  'usage limit'
+  'limit reached'
+  '5-hour limit'
+  'try again at'
+  'reset.*hours'
+  'quota exceeded'
+  'too many requests'
+  'out of extra usage'
+)
+
+# Build a single grep -E alternation
+build_pattern() {
+  local IFS='|'; echo "${LIMIT_PATTERNS[*]}"
+}
+
+# claude-acct: PATH, else executable next to this script (same install dir).
+CLAUDE_ACCT_BIN=""
+resolve_claude_acct_bin() {
+  CLAUDE_ACCT_BIN=""
+  if command -v claude-acct &>/dev/null; then
+    CLAUDE_ACCT_BIN=$(command -v claude-acct)
+    return 0
+  fi
+  local _here _dir
+  _here=${BASH_SOURCE[0]}
+  while [[ -L "$_here" ]]; do
+    _here=$(readlink "$_here") || break
+  done
+  _dir=$(cd "$(dirname "$_here")" && pwd) || return 1
+  if [[ -x "$_dir/claude-acct" ]]; then
+    CLAUDE_ACCT_BIN="$_dir/claude-acct"
+    return 0
+  fi
+  return 1
+}
+
+if [[ -t 1 ]]; then
+  C_YEL=$'\e[33m'; C_GREEN=$'\e[32m'; C_RED=$'\e[31m'; C_BOLD=$'\e[1m'; C_RESET=$'\e[0m'
+else
+  C_YEL=''; C_GREEN=''; C_RED=''; C_BOLD=''; C_RESET=''
+fi
+
+# Log rotation: drop files older than N days. Best-effort, silent.
+rotate_logs() {
+  find "$LOG_DIR" -maxdepth 1 -type f -name '*.log' -mtime "+$LOG_RETENTION_DAYS" -delete 2>/dev/null || true
+}
+
+# Argument parsing
+AUTO_SWITCH=1
+WATCH=1
+REMOTE_CONTROL=1
+CLAUDE_ARGS=()
+for a in "$@"; do
+  case "$a" in
+    --no-auto-switch)   AUTO_SWITCH=0 ;;
+    --no-watch)         WATCH=0 ;;
+    --no-remote-control) REMOTE_CONTROL=0 ;;
+    *)                  CLAUDE_ARGS+=("$a") ;;
+  esac
+done
+
+# Enable Remote Control on interactive sessions (matches /config "all sessions").
+apply_remote_control_args() {
+  (( REMOTE_CONTROL )) || return 0
+  local first="${CLAUDE_ARGS[0]-}"
+  case "$first" in
+    agents|auth|auto-mode|doctor|install|mcp|plugin|plugins|project|setup-token|ultrareview|update|upgrade)
+      return 0 ;;
+  esac
+  local a
+  for a in "${CLAUDE_ARGS[@]}"; do
+    case "$a" in
+      --remote-control|--rc) return 0 ;;
+      -p|--print)             return 0 ;;
+    esac
+  done
+  CLAUDE_ARGS=(--remote-control "${CLAUDE_ARGS[@]}")
+}
+apply_remote_control_args
+
+# End-of-run check: look for the pattern only in the LAST N lines.
+detect_limit_in() {
+  local logfile="$1"
+  [[ -f "$logfile" ]] || return 1
+  local pattern
+  pattern=$(build_pattern)
+  tail -n "$TAIL_LINES" "$logfile" 2>/dev/null | grep -qiE "$pattern"
+}
+
+# Live watcher: tail -F the log; on first match write a marker and notify.
+# Exits after the first match (one event per attempt is enough).
+# The subshell explicitly redirects stdin/stdout/stderr to /dev/null so that
+# command substitution `$(start_watcher ...)` returns immediately after echo.
+start_watcher() {
+  local logfile="$1"
+  local marker="$2"
+  local pattern
+  pattern=$(build_pattern)
+  (
+    # Wait for the log file to appear
+    local tries=0
+    while [[ ! -f "$logfile" ]] && (( tries < 50 )); do
+      sleep 0.1; ((tries++))
+    done
+    [[ -f "$logfile" ]] || exit 0
+    tail -F -n 0 "$logfile" 2>/dev/null | while IFS= read -r line; do
+      if echo "$line" | grep -qiE "$pattern"; then
+        date +%s > "$marker"
+        # Bell on the terminal — works through SSH/tmux on most emulators
+        printf '\a' > /dev/tty 2>/dev/null || true
+        # Best-effort desktop notification
+        if command -v notify-send &>/dev/null; then
+          notify-send -u critical -i dialog-warning \
+            "Claude Code: rate-limit" \
+            "Rate-limit detected. claudex will switch accounts when the session ends." \
+            2>/dev/null || true
+        fi
+        # Prominent message on the user's TTY
+        {
+          echo
+          printf '%s\n' "${C_YEL}${C_BOLD}⚠  [claudex] RATE-LIMIT DETECTED${C_RESET}"
+          echo "${C_YEL}   The auto-switch will run when claude exits. Press Ctrl+C now to exit immediately.${C_RESET}"
+        } > /dev/tty 2>/dev/null || true
+        exit 0
+      fi
+    done
+  ) </dev/null >/dev/null 2>&1 &
+  echo $!
+}
+
+LAST_LOG=""
+LAST_MARKER=""
+
+attempt() {
+  local cycle_n="$1"
+  local stamp
+  stamp=$(date +%Y%m%d-%H%M%S)
+  LAST_LOG="$LOG_DIR/${stamp}.cycle${cycle_n}.log"
+  LAST_MARKER="$LOG_DIR/${stamp}.cycle${cycle_n}.marker"
+  rm -f "$LAST_MARKER"
+
+  local active
+  active=$(cat "$HOME/.claude/accounts/active" 2>/dev/null | tr -d '[:space:]')
+  echo "${C_BOLD}[claudex]${C_RESET} cycle $cycle_n / 2 on account: ${active:-?}"
+
+  local quoted
+  quoted=$(printf '%q ' claude "${CLAUDE_ARGS[@]}")
+  quoted=${quoted%% }
+
+  local watcher_pid=""
+  local rc
+
+  # Interactive TTY: run script(1) in a pseudo-terminal while keeping this shell
+  # as the controlling foreground session. If we background the *watcher* before
+  # script, job %1 becomes the watcher and `fg %1` would steal the wrong PTY —
+  # so script must be the first background job, then the watcher.
+  if [[ -t 0 ]] && [[ -t 1 ]]; then
+    set -m
+    script -q -e -f -c "$quoted" "$LAST_LOG" &
+    if (( WATCH )); then
+      watcher_pid=$(start_watcher "$LAST_LOG" "$LAST_MARKER")
+    fi
+    fg %1
+    rc=$?
+    set +m
+  else
+    if (( WATCH )); then
+      watcher_pid=$(start_watcher "$LAST_LOG" "$LAST_MARKER")
+    fi
+    script -q -e -f -c "$quoted" "$LAST_LOG"
+    rc=$?
+  fi
+
+  if [[ -n "$watcher_pid" ]]; then
+    kill -TERM "$watcher_pid" 2>/dev/null || true
+    pkill -P "$watcher_pid" 2>/dev/null || true
+    wait "$watcher_pid" 2>/dev/null || true
+  fi
+
+  return "$rc"
+}
+
+# Verdict: live marker present OR pattern in the trailing N lines
+limit_detected() {
+  [[ -f "$LAST_MARKER" ]] && return 0
+  detect_limit_in "$LAST_LOG"
+}
+
+main() {
+  if ! command -v claude &>/dev/null; then
+    echo "claudex: 'claude' not found in PATH" >&2
+    exit 127
+  fi
+  if ! resolve_claude_acct_bin; then
+    echo "claudex: 'claude-acct' not found — install it to PATH or put claude-acct next to this script (same directory as claudex)." >&2
+    exit 127
+  fi
+
+  rotate_logs
+
+  local rc
+  attempt 1
+  rc=$?
+
+  # Claude often exits 0 from the TUI even after showing usage-limit UI; rely on
+  # log/marker detection, not solely on non-zero exit status.
+  if (( AUTO_SWITCH )) && limit_detected; then
+    echo
+    echo "${C_YEL}⚠  [claudex] Rate-limit confirmed. Switching accounts...${C_RESET}"
+    # Critical section: take a lock so two concurrent claudex sessions
+    # don't switch on top of each other.
+    (
+      flock -w 5 9 || { echo "${C_RED}[claudex] another switch in progress, skipping.${C_RESET}"; exit 1; }
+      "$CLAUDE_ACCT_BIN" mark-limit >/dev/null 2>&1 || true
+      "$CLAUDE_ACCT_BIN" switch >/dev/null 2>&1
+    ) 9>"$LOCK_FILE"
+    local switch_rc=$?
+
+    if (( switch_rc == 0 )); then
+      local new_active
+      new_active=$(cat "$HOME/.claude/accounts/active" | tr -d '[:space:]')
+      echo "${C_GREEN}✓  Switched to '$new_active'. Re-running with --continue...${C_RESET}"
+      echo
+      local has_continue=0
+      for a in "${CLAUDE_ARGS[@]}"; do
+        if [[ "$a" == "-c" || "$a" == "--continue" ]]; then has_continue=1; break; fi
+      done
+      (( has_continue )) || CLAUDE_ARGS=(--continue "${CLAUDE_ARGS[@]}")
+
+      attempt 2
+      rc=$?
+      if limit_detected; then
+        echo
+        echo "${C_YEL}⚠  [claudex] Rate-limit hit on the second account too.${C_RESET}"
+        echo "   Current state:"
+        "$CLAUDE_ACCT_BIN" list 2>/dev/null || true
+        echo "   Wait for the reset (see STATUS above) or add a third account: ${C_BOLD}claude-acct add <name>${C_RESET}"
+      fi
+    else
+      echo "${C_RED}[claudex] switch failed (single account or lock held).${C_RESET}"
+    fi
+  fi
+
+  exit "$rc"
+}
+
+main "$@"

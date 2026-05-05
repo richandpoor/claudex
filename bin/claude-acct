@@ -1,0 +1,528 @@
+#!/usr/bin/env bash
+# claude-acct — Multi-account manager for Claude Code (CLI tool)
+#
+# Stores each account's OAuth credentials in a separate file inside
+# ~/.claude/accounts/, and switches the active account by repointing
+# the symlink ~/.claude/.credentials.json. The token refresh performed
+# by Claude Code follows the symlink, so each per-account file stays
+# up-to-date automatically.
+#
+# Layout under ~/.claude/accounts/:
+#   <name>.json          OAuth credentials for "name" (chmod 600)
+#   <name>.email         Cached email (best-effort, populated lazily)
+#   <name>.last-limit    Epoch timestamp of last detected rate-limit
+#   active               One-line file: name of the currently active account
+#
+# ~/.claude/.credentials.json is a SYMLINK to accounts/<active>.json.
+
+set -euo pipefail
+
+readonly ACCT_DIR="$HOME/.claude/accounts"
+readonly CRED_LINK="$HOME/.claude/.credentials.json"
+readonly ACTIVE_FILE="$ACCT_DIR/active"
+# Claude Pro/Max rate-limit window (5 hours). Used to estimate reset time.
+readonly LIMIT_WINDOW_SECS=$((5 * 3600))
+
+# Colors when stdout is a TTY
+if [[ -t 1 ]]; then
+  C_BOLD=$'\e[1m'; C_DIM=$'\e[2m'; C_GREEN=$'\e[32m'; C_RED=$'\e[31m'
+  C_BLUE=$'\e[34m'; C_YEL=$'\e[33m'; C_RESET=$'\e[0m'
+else
+  C_BOLD=''; C_DIM=''; C_GREEN=''; C_RED=''; C_BLUE=''; C_YEL=''; C_RESET=''
+fi
+
+die()  { echo "${C_RED}error:${C_RESET} $*" >&2; exit 1; }
+info() { echo "${C_BLUE}→${C_RESET} $*"; }
+ok()   { echo "${C_GREEN}✓${C_RESET} $*"; }
+
+# Validate that the multi-account layout is in place. If the user has only
+# ever used a single account, ~/.claude/.credentials.json is a regular file
+# and needs to be migrated into accounts/ (see README "Bootstrap").
+ensure_setup() {
+  [[ -d "$ACCT_DIR" ]] || die "accounts dir missing: $ACCT_DIR — run bootstrap first (see README)"
+  [[ -f "$ACTIVE_FILE" ]] || die "'active' file missing in $ACCT_DIR"
+  if [[ ! -L "$CRED_LINK" ]]; then
+    die "$CRED_LINK is not a symlink. To recover:
+  mv $CRED_LINK $ACCT_DIR/<name>.json
+  ln -s accounts/<name>.json $CRED_LINK
+  echo <name> > $ACTIVE_FILE"
+  fi
+}
+
+current_active() {
+  cat "$ACTIVE_FILE" 2>/dev/null | tr -d '[:space:]'
+}
+
+list_accounts() {
+  local f
+  for f in "$ACCT_DIR"/*.json; do
+    [[ -f "$f" ]] || continue
+    local b
+    b=$(basename "$f" .json)
+    [[ "$b" == .* ]] && continue
+    echo "$b"
+  done | sort
+}
+
+# Extract subscriptionType + rateLimitTier from a credentials file
+acct_info() {
+  local file="$1"
+  [[ -f "$file" ]] || { echo "—|—"; return; }
+  python3 - "$file" <<'PY' 2>/dev/null || echo "—|—"
+import json, sys
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+oa = d.get('claudeAiOauth', {})
+print(f"{oa.get('subscriptionType') or '—'}|{oa.get('rateLimitTier') or '—'}")
+PY
+}
+
+# Capture the active account's email by parsing `claude auth status`.
+# Saves it to accounts/<active>.email when changed. Idempotent and safe
+# to call repeatedly. Used opportunistically by `list` and `status`.
+capture_active_email() {
+  command -v claude &>/dev/null || return 0
+  local active
+  active=$(current_active) || return 0
+  [[ -n "$active" ]] || return 0
+  local out email name other_e cache
+  out=$(claude auth status 2>&1 || true)
+  email=$(printf '%s' "$out" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print(d.get('email') or '', end='')
+except Exception:
+    pass
+" 2>/dev/null || true)
+  [[ -z "$email" ]] && email=$(echo "$out" | grep -oE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' | head -n1 || true)
+  [[ -n "$email" ]] || return 0
+  # Native Claude sometimes keeps reporting the previous identity after we repoint
+  # ~/.claude/.credentials.json — do not pin that email onto another profile slot.
+  for name in $(list_accounts); do
+    [[ "$name" == "$active" ]] && continue
+    [[ -f "$ACCT_DIR/$name.email" ]] || continue
+    other_e=$(cat "$ACCT_DIR/$name.email" 2>/dev/null | tr -d '[:space:]')
+    [[ "$other_e" == "$email" ]] && return 0
+  done
+  cache="$ACCT_DIR/$active.email"
+  if [[ ! -f "$cache" ]] || [[ "$(cat "$cache" 2>/dev/null)" != "$email" ]]; then
+    echo "$email" > "$cache"
+    chmod 600 "$cache"
+  fi
+}
+
+# Plain-text reset countdown for table layout (no ANSI — keeps columns aligned).
+# 1) Optional ~/.claude/accounts/<name>.reset-at — one line: unix epoch seconds,
+#    or a string `date -d` understands (e.g. "2026-05-04 20:30:00") for wall-clock
+#    reset (matches Claude /extra-usage better than the sliding window below).
+# 2) Else ~/.claude/accounts/<name>.last-limit + LIMIT_WINDOW_SECS (estimate only).
+account_reset_plain() {
+  local name="$1"
+  local now h m ts remaining elapsed lf hrs_ago days parsed
+  now=$(date +%s)
+  local rf="$ACCT_DIR/$name.reset-at"
+  if [[ -f "$rf" ]]; then
+    ts=$(cat "$rf" 2>/dev/null | tr -d '[:space:]')
+    if ! [[ "$ts" =~ ^[0-9]+$ ]]; then
+      parsed=$(date -d "$ts" +%s 2>/dev/null) || parsed=""
+      ts="${parsed:-}"
+    fi
+    if [[ -n "$ts" ]] && [[ "$ts" =~ ^[0-9]+$ ]]; then
+      remaining=$((ts - now))
+      if (( remaining > 0 )); then
+        h=$((remaining / 3600))
+        m=$(((remaining % 3600) / 60))
+        printf '%s' "in ${h}h ${m}m (wall)"
+        return
+      fi
+    fi
+  fi
+  lf="$ACCT_DIR/$name.last-limit"
+  [[ -f "$lf" ]] || { printf '%s' '—'; return; }
+  ts=$(cat "$lf" 2>/dev/null | tr -d '[:space:]')
+  [[ "$ts" =~ ^[0-9]+$ ]] || { printf '%s' '—'; return; }
+  elapsed=$((now - ts))
+  remaining=$((LIMIT_WINDOW_SECS - elapsed))
+  if (( remaining <= 0 )); then
+    hrs_ago=$((elapsed / 3600))
+    if (( hrs_ago > 24 )); then
+      days=$((hrs_ago / 24))
+      printf '%s' ">${days}d since mark"
+    else
+      printf '%s' "ok (~${hrs_ago}h ago)"
+    fi
+  else
+    h=$((remaining / 3600))
+    m=$(((remaining % 3600) / 60))
+    printf '%s' "in ${h}h ${m}m (est.)"
+  fi
+}
+
+# Globals used by the restore-active trap. Set before any temporary switch loop;
+# cleared after the final restore so the trap is a no-op once disarmed.
+_RESTORE_ACTIVE=""
+
+# Re-point the credentials symlink + ACTIVE_FILE back to whatever account was
+# active when the temporary-switch loop started. Idempotent.
+restore_active_account() {
+  [[ -n "$_RESTORE_ACTIVE" ]] || return 0
+  ln -sfn "accounts/$_RESTORE_ACTIVE.json" "$CRED_LINK"
+  echo "$_RESTORE_ACTIVE" > "$ACTIVE_FILE"
+  _RESTORE_ACTIVE=""
+}
+
+# When listing on a TTY, fill missing *.email by briefly activating each account
+# (same idea as refresh-info, but only for gaps).
+cache_missing_emails_for_list() {
+  [[ -t 1 ]] || return 0
+  command -v claude &>/dev/null || return 0
+  local name need=0
+  _RESTORE_ACTIVE=$(current_active)
+  for name in $(list_accounts); do
+    [[ ! -f "$ACCT_DIR/$name.email" ]] && need=1 && break
+  done
+  (( need )) || { _RESTORE_ACTIVE=""; return 0; }
+  echo "${C_DIM}→ caching missing emails (short credential switches)…${C_RESET}" >&2
+  # Ctrl+C between switches would otherwise leave the wrong account active.
+  trap 'restore_active_account; exit 130' INT TERM
+  for name in $(list_accounts); do
+    [[ -f "$ACCT_DIR/$name.email" ]] && continue
+    ln -sfn "accounts/$name.json" "$CRED_LINK"
+    echo "$name" > "$ACTIVE_FILE"
+    capture_active_email || true
+  done
+  trap - INT TERM
+  restore_active_account
+}
+
+cmd_list() {
+  ensure_setup
+  cache_missing_emails_for_list
+  capture_active_email || true
+  local active
+  active=$(current_active)
+  echo "${C_BOLD}Configured Claude Code accounts${C_RESET}"
+  echo
+  printf "  %-4s ${C_BOLD}%-12s${C_RESET} %-8s %-12s %-38s ${C_YEL}%-28s${C_RESET}\n" \
+    "" "NAME" "SUB" "TIER" "EMAIL" "RESET"
+  echo "  ────────────────────────────────────────────────────────────────────────────────────────────────────────────"
+  local name info sub tier tier_short email_cache email rest reset_plain reset_vis email_vis
+  for name in $(list_accounts); do
+    info=$(acct_info "$ACCT_DIR/$name.json")
+    sub="${info%%|*}"; rest="${info#*|}"
+    tier="${rest%%|*}"
+    tier_short="${tier#default_}"
+    [[ ${#tier_short} -gt 12 ]] && tier_short="${tier_short:0:12}"
+    email_cache="$ACCT_DIR/$name.email"
+    if [[ -f "$email_cache" ]]; then
+      email=$(cat "$email_cache" 2>/dev/null | tr -d '[:space:]')
+    else
+      email="—"
+    fi
+    if ((${#email} > 37)); then
+      email_vis="${email:0:34}..."
+    else
+      email_vis="$email"
+    fi
+    reset_plain=$(account_reset_plain "$name")
+    reset_vis=$(printf '%-28s' "$reset_plain")
+    if [[ "$name" == "$active" ]]; then
+      printf "  ${C_GREEN}%-4s${C_RESET}" "*"
+    else
+      printf "  %-4s" ""
+    fi
+    printf " ${C_BOLD}%-12s${C_RESET} %-8s %-12s %-38s ${C_YEL}%s${C_RESET}\n" \
+      "$name" "$sub" "$tier_short" "$email_vis" "$reset_vis"
+  done
+  echo
+  echo "${C_DIM}RESET (wall) = ~/.claude/accounts/<name>.reset-at  ·  (est.) = last mark-limit + 5h sliding window (often differs from Claude /extra-usage).${C_RESET}"
+  echo "${C_DIM}Email gaps: native CLI auth cache may ignore symlink swaps → ${C_BOLD}claude-acct set-email <name> you@domain${C_RESET}"
+  if [[ -n "$active" ]]; then
+    echo "${C_DIM}Active: ${active}. Switch: ${C_BOLD}claude-acct switch [<name>]${C_RESET}"
+  fi
+}
+
+cmd_status() {
+  ensure_setup
+  capture_active_email || true
+  local active
+  active=$(current_active)
+  echo "${C_BOLD}Active account:${C_RESET} $active"
+  if command -v claude &>/dev/null; then
+    echo
+    claude auth status 2>&1 || true
+  fi
+}
+
+cmd_use() {
+  ensure_setup
+  local target="${1:-}"
+  [[ -n "$target" ]] || die "usage: claude-acct use <name>"
+  [[ -f "$ACCT_DIR/$target.json" ]] || die "account '$target' does not exist. List: claude-acct list"
+  local current
+  current=$(current_active)
+  if [[ "$current" == "$target" ]]; then
+    info "Already on '$target'"
+    return 0
+  fi
+  ln -sfn "accounts/$target.json" "$CRED_LINK"
+  echo "$target" > "$ACTIVE_FILE"
+  ok "Active account: ${C_BOLD}$target${C_RESET} (was: $current)"
+}
+
+# Round-robin switch: with no arg, advance to the next account in
+# alphabetical order. With an arg, alias of 'use'.
+cmd_switch() {
+  ensure_setup
+  local target="${1:-}"
+  if [[ -n "$target" ]]; then
+    cmd_use "$target"
+    return
+  fi
+  local accounts current next
+  mapfile -t accounts < <(list_accounts)
+  (( ${#accounts[@]} >= 2 )) || die "switch requires at least 2 accounts (you have ${#accounts[@]})"
+  current=$(current_active)
+  local i found=-1
+  for i in "${!accounts[@]}"; do
+    [[ "${accounts[$i]}" == "$current" ]] && { found=$i; break; }
+  done
+  if (( found < 0 )); then
+    next="${accounts[0]}"
+  else
+    next="${accounts[$(( (found + 1) % ${#accounts[@]} ))]}"
+  fi
+  cmd_use "$next"
+}
+
+# Globals consumed by _add_rollback. Set early in cmd_add; cleared on success.
+_ADD_CURRENT=""
+_ADD_NAME=""
+_ADD_BACKUP=""
+
+# Single rollback path for cmd_add. Covers Ctrl+C between logout and the
+# activation prompt, plus unexpected errors from any intermediate command.
+# Idempotent: the globals are cleared after the first run so a second trigger
+# (e.g. ERR followed by EXIT) is a no-op.
+_add_rollback() {
+  [[ -n "$_ADD_CURRENT" ]] || return 0
+  echo
+  info "rolling back add: restoring '$_ADD_CURRENT'"
+  if [[ -f "$_ADD_BACKUP" ]]; then
+    mv -f "$_ADD_BACKUP" "$ACCT_DIR/$_ADD_CURRENT.json"
+  fi
+  if [[ -n "$_ADD_NAME" ]]; then
+    rm -f "$ACCT_DIR/$_ADD_NAME.json" "$ACCT_DIR/$_ADD_NAME.email" \
+          "$ACCT_DIR/$_ADD_NAME.last-limit" "$ACCT_DIR/$_ADD_NAME.reset-at"
+  fi
+  ln -sfn "accounts/$_ADD_CURRENT.json" "$CRED_LINK"
+  echo "$_ADD_CURRENT" > "$ACTIVE_FILE"
+  _ADD_CURRENT=""; _ADD_NAME=""; _ADD_BACKUP=""
+}
+
+cmd_add() {
+  ensure_setup
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "usage: claude-acct add <name>"
+  [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || die "invalid name (a-z, A-Z, 0-9, _, - only)"
+  [[ ! -f "$ACCT_DIR/$name.json" ]] || die "account '$name' already exists"
+
+  _ADD_CURRENT=$(current_active)
+  _ADD_NAME="$name"
+  _ADD_BACKUP="$ACCT_DIR/.bak-$_ADD_CURRENT.$$"
+  info "Backing up current account '$_ADD_CURRENT' credentials"
+  cp "$ACCT_DIR/$_ADD_CURRENT.json" "$_ADD_BACKUP"
+
+  # Arm the rollback before we touch shared state (logout invalidates tokens).
+  trap '_add_rollback; exit 130' INT TERM
+  trap '_add_rollback' ERR
+
+  echo
+  echo "${C_YEL}⚠${C_RESET}  About to ${C_BOLD}claude auth logout${C_RESET} the current account so you can log in to the new one."
+  echo "   Continue when you're ready to enter the credentials of the NEW account."
+  read -rp "Press ENTER to proceed (Ctrl+C to abort): "
+
+  claude auth logout || true
+
+  echo
+  echo "${C_BLUE}→${C_RESET} Running ${C_BOLD}claude auth login${C_RESET} — follow the on-screen instructions (browser)."
+  if ! claude auth login; then
+    _add_rollback
+    trap - INT TERM ERR
+    die "abort"
+  fi
+
+  if [[ -L "$CRED_LINK" ]]; then
+    die "unexpected: $CRED_LINK is still a symlink after login"
+  fi
+  mv "$CRED_LINK" "$ACCT_DIR/$name.json"
+  chmod 600 "$ACCT_DIR/$name.json"
+
+  # Briefly activate the new account so we can capture its email
+  ln -sfn "accounts/$name.json" "$CRED_LINK"
+  echo "$name" > "$ACTIVE_FILE"
+  capture_active_email || true
+
+  echo
+  echo "${C_BOLD}Account '$name' added.${C_RESET}"
+  read -rp "Activate it now? [Y/n] " ans
+  ans="${ans,,}"
+  if [[ "$ans" == "n" || "$ans" == "no" ]]; then
+    mv -f "$_ADD_BACKUP" "$ACCT_DIR/$_ADD_CURRENT.json"
+    ln -sfn "accounts/$_ADD_CURRENT.json" "$CRED_LINK"
+    echo "$_ADD_CURRENT" > "$ACTIVE_FILE"
+    trap - INT TERM ERR
+    ok "Added ${C_BOLD}$name${C_RESET}, active account remains ${C_BOLD}$_ADD_CURRENT${C_RESET}"
+  else
+    mv -f "$_ADD_BACKUP" "$ACCT_DIR/$_ADD_CURRENT.json"
+    trap - INT TERM ERR
+    ok "Added and activated ${C_BOLD}$name${C_RESET} (previous: $_ADD_CURRENT)"
+  fi
+  _ADD_CURRENT=""; _ADD_NAME=""; _ADD_BACKUP=""
+}
+
+cmd_rm() {
+  ensure_setup
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "usage: claude-acct rm <name>"
+  [[ -f "$ACCT_DIR/$name.json" ]] || die "account '$name' does not exist"
+  local current
+  current=$(current_active)
+  [[ "$name" != "$current" ]] || die "cannot remove the active account. Switch first: claude-acct switch"
+  read -rp "Confirm deletion of '$name'? (yes/no) " ans
+  [[ "$ans" == "yes" ]] || { info "aborted"; exit 0; }
+  rm -f "$ACCT_DIR/$name.json" "$ACCT_DIR/$name.email" "$ACCT_DIR/$name.last-limit" "$ACCT_DIR/$name.reset-at"
+  ok "Removed account '$name'"
+}
+
+# Mark the last rate-limit time for <name> (default: active account).
+# Called by claudex right before performing an automatic switch.
+cmd_mark_limit() {
+  ensure_setup
+  local name="${1:-$(current_active)}"
+  [[ -f "$ACCT_DIR/$name.json" ]] || die "account '$name' does not exist"
+  date +%s > "$ACCT_DIR/$name.last-limit"
+  chmod 600 "$ACCT_DIR/$name.last-limit"
+  echo "${C_DIM}rate-limit recorded for '$name' at $(date '+%Y-%m-%d %H:%M:%S')${C_RESET}"
+}
+
+# Populate cached email for every account by briefly switching to each one.
+# Skips accounts that already have a cached email unless --force is passed.
+# Restores the originally active account at the end.
+cmd_set_email() {
+  ensure_setup
+  local name addr
+  name="${1:-}"
+  addr="${2:-}"
+  [[ -n "$name" && -n "$addr" ]] || die "usage: claude-acct set-email <name> <address>"
+  [[ -f "$ACCT_DIR/$name.json" ]] || die "unknown account '$name'"
+  addr=$(echo "$addr" | tr -d '[:space:]')
+  echo "$addr" > "$ACCT_DIR/$name.email"
+  chmod 600 "$ACCT_DIR/$name.email"
+  ok "email for '${C_BOLD}$name${C_RESET}' cached (${addr})"
+}
+
+cmd_set_reset_at() {
+  ensure_setup
+  local name arg ts
+  name="${1:-}"
+  arg="${2:-}"
+  [[ -n "$name" && -n "$arg" ]] || die "usage: claude-acct set-reset-at <name> <epoch|datetime|relative>
+  examples:
+    claude-acct set-reset-at A '2026-05-04 20:30:00'
+    claude-acct set-reset-at B '+3 hours 39 minutes'"
+  [[ -f "$ACCT_DIR/$name.json" ]] || die "unknown account '$name'"
+  if [[ "$arg" =~ ^[0-9]+$ ]]; then
+    ts="$arg"
+  else
+    ts=$(date -d "$arg" +%s) || die "could not parse time (GNU date): $arg"
+  fi
+  echo "$ts" > "$ACCT_DIR/$name.reset-at"
+  chmod 600 "$ACCT_DIR/$name.reset-at"
+  ok "wall reset for '${C_BOLD}$name${C_RESET}' → $(date -d "@$ts" '+%Y-%m-%d %H:%M:%S %z')"
+}
+
+cmd_refresh_info() {
+  ensure_setup
+  local force=0
+  if [[ "${1:-}" == "--force" ]]; then force=1; fi
+  _RESTORE_ACTIVE=$(current_active)
+  local accounts done_any=0
+  mapfile -t accounts < <(list_accounts)
+  trap 'restore_active_account; exit 130' INT TERM
+  for name in "${accounts[@]}"; do
+    if [[ -f "$ACCT_DIR/$name.email" ]] && (( ! force )); then
+      info "$name: email cached, skip ($(cat "$ACCT_DIR/$name.email"))"
+      continue
+    fi
+    info "$name: temporary switch to read email…"
+    ln -sfn "accounts/$name.json" "$CRED_LINK"
+    echo "$name" > "$ACTIVE_FILE"
+    capture_active_email || true
+    if [[ -f "$ACCT_DIR/$name.email" ]]; then
+      ok "$name → $(cat "$ACCT_DIR/$name.email")"
+      done_any=1
+    else
+      echo "${C_YEL}⚠${C_RESET} $name: could not read email (auth status did not expose it)"
+    fi
+  done
+  trap - INT TERM
+  local original="$_RESTORE_ACTIVE"
+  restore_active_account
+  if (( done_any )); then
+    ok "restored active account: ${C_BOLD}$original${C_RESET}"
+  else
+    info "no updates needed (use --force to re-read)"
+  fi
+}
+
+cmd_help() {
+  cat <<'EOF'
+claude-acct — multi-account manager for Claude Code
+
+USAGE
+  claude-acct list                   Show configured accounts + email + rate-limit status
+  claude-acct status                 Active account + claude auth status
+  claude-acct use <name>             Set <name> as active (swap symlink)
+  claude-acct switch [<name>]        Without arg: round-robin to the next account.
+                                     With <name>: alias of 'use'.
+  claude-acct add <name>             Add a new account (logout + interactive login)
+  claude-acct rm <name>              Remove an account from disk
+  claude-acct mark-limit [<name>]    Record rate-limit now (default: active)
+  claude-acct refresh-info [--force] Populate cached email for every account
+                                     (briefly switches each one, then restores)
+  claude-acct set-email <name> <addr> Pin mailbox label when auth status can't switch cleanly
+  claude-acct set-reset-at <n> <t>   Wall-clock extra-usage reset for list display
+                                     (<t> = unix epoch, or string for GNU date -d)
+  claude-acct help                   This help
+
+FILES
+  ~/.claude/accounts/<name>.json        OAuth credentials (chmod 600)
+  ~/.claude/accounts/<name>.email       Cached email
+  ~/.claude/accounts/<name>.last-limit  Epoch ts of last rate-limit (claudex mark-limit)
+  ~/.claude/accounts/<name>.reset-at    Optional wall-clock reset (epoch or date string)
+  ~/.claude/accounts/active             Name of the active account
+  ~/.claude/.credentials.json           → symlink to accounts/<active>.json
+
+EOF
+}
+
+# ─── Dispatch ────────────────────────────────────────────────────────────
+cmd="${1:-list}"
+shift || true
+
+case "$cmd" in
+  list|ls)              cmd_list "$@" ;;
+  status|st)            cmd_status "$@" ;;
+  use)                  cmd_use "$@" ;;
+  switch|sw)            cmd_switch "$@" ;;
+  add)                  cmd_add "$@" ;;
+  rm|remove|del)        cmd_rm "$@" ;;
+  mark-limit|mark)      cmd_mark_limit "$@" ;;
+  refresh-info|refresh) cmd_refresh_info "$@" ;;
+  set-email|email)       cmd_set_email "$@" ;;
+  set-reset-at|reset-at) cmd_set_reset_at "$@" ;;
+  help|-h|--help)       cmd_help ;;
+  *)                    echo "Unknown command: $cmd"; cmd_help; exit 1 ;;
+esac
