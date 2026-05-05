@@ -62,7 +62,9 @@ load test_helper
   [ "$status" -eq 0 ]
   ts=$(cat "$HOME/.claude/accounts/A.reset-at")
   [[ "$ts" =~ ^[0-9]+$ ]]
-  expected=$(date -d "2099-01-01 00:00:00" +%s)
+  # Portable expected-value: GNU date first, BSD date fallback.
+  expected=$(date -d "2099-01-01 00:00:00" +%s 2>/dev/null \
+    || date -j -f "%Y-%m-%d %H:%M:%S" "2099-01-01 00:00:00" +%s)
   [ "$ts" = "$expected" ]
 }
 
@@ -78,12 +80,13 @@ load test_helper
   [ ! -f "$HOME/.claude/accounts/B.json" ]
 }
 
-@test "ensure_setup fails when the symlink has been replaced by a regular file" {
-  rm "$HOME/.claude/.credentials.json"
-  echo '{"x":1}' > "$HOME/.claude/.credentials.json"
+@test "ensure_setup fails when accounts/ directory is missing entirely" {
+  # An unrecoverable state: heal_credentials_link can't fix this because
+  # there's no active account to absorb credentials into.
+  rm -rf "$HOME/.claude/accounts"
   run "$CLAUDE_ACCT_BIN" list
   [ "$status" -ne 0 ]
-  [[ "$output" == *"not a symlink"* ]]
+  [[ "$output" == *"accounts dir missing"* ]] || [[ "$output" == *"init"* ]]
 }
 
 @test "switch fails when only one account exists" {
