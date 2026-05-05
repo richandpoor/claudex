@@ -92,3 +92,75 @@ load test_helper
   [ "$status" -ne 0 ]
   [[ "$output" == *"requires at least 2 accounts"* ]]
 }
+
+@test "switch skips accounts marked rate-limited recently" {
+  # Add a third account C, mark B as rate-limited just now. From A, switch
+  # should skip B and land on C.
+  cat > "$HOME/.claude/accounts/C.json" <<'JSON'
+{"claudeAiOauth":{"subscriptionType":"pro","rateLimitTier":"default_tier_1","accessToken":"c"}}
+JSON
+  chmod 600 "$HOME/.claude/accounts/C.json"
+  date +%s > "$HOME/.claude/accounts/B.last-limit"
+  run "$CLAUDE_ACCT_BIN" switch
+  [ "$status" -eq 0 ]
+  [ "$(active_target)" = "C.json" ]
+}
+
+@test "switch falls back to round-robin when every other account is rate-limited" {
+  date +%s > "$HOME/.claude/accounts/B.last-limit"
+  run "$CLAUDE_ACCT_BIN" switch
+  [ "$status" -eq 0 ]
+  [ "$(active_target)" = "B.json" ]
+  [[ "$output" == *"falling back"* ]]
+}
+
+@test "init bootstraps a single-credential layout into accounts/" {
+  # Reset to legacy layout: regular credentials.json, no accounts/.
+  rm -rf "$HOME/.claude"
+  mkdir -p "$HOME/.claude"
+  echo '{"claudeAiOauth":{"subscriptionType":"max20","accessToken":"x"}}' \
+    > "$HOME/.claude/.credentials.json"
+
+  run "$CLAUDE_ACCT_BIN" init main
+  [ "$status" -eq 0 ]
+  [ -L "$HOME/.claude/.credentials.json" ]
+  [ "$(active_target)" = "main.json" ]
+  [ "$(active_file_contents)" = "main" ]
+  [ -f "$HOME/.claude/accounts/main.json" ]
+  perms=$(stat -c '%a' "$HOME/.claude/accounts/main.json")
+  [ "$perms" = "600" ]
+}
+
+@test "init refuses to clobber an already-initialised setup" {
+  run "$CLAUDE_ACCT_BIN" init main
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"already initialised"* ]]
+}
+
+@test "list --json emits well-formed JSON with both accounts" {
+  run "$CLAUDE_ACCT_BIN" list --json
+  [ "$status" -eq 0 ]
+  # The output must round-trip through python's json parser.
+  echo "$output" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+assert d['active'] == 'A', d
+names = sorted(a['name'] for a in d['accounts'])
+assert names == ['A', 'B'], names
+active = [a for a in d['accounts'] if a['active']]
+assert len(active) == 1 and active[0]['name'] == 'A', active
+"
+}
+
+@test "list --json marks recently rate-limited accounts" {
+  date +%s > "$HOME/.claude/accounts/B.last-limit"
+  run "$CLAUDE_ACCT_BIN" list --json
+  [ "$status" -eq 0 ]
+  echo "$output" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+b = next(a for a in d['accounts'] if a['name'] == 'B')
+assert b['rate_limited'] is True, b
+assert isinstance(b['last_limit'], int), b
+"
+}

@@ -64,10 +64,9 @@ assert_no_match() {
   assert_match "$FIXTURES/limit-rate-limit-options.log"
 }
 
-@test "no false positive on logs with unrelated 'limit' / 'reset' words" {
-  # Only checks the bare words "limit" and "reset" in unrelated context.
-  # The phrase "rate limit" itself WILL match by design — the patterns are
-  # intentionally broad. Mitigation lives in claudex's TAIL_LINES=80
-  # end-of-run check, not in pattern tightness.
+@test "no false positive on logs that mention 'rate limit' in unrelated context" {
+  # Includes lines like "Set new connection rate limit to 100 req/sec" and
+  # 'see "rate limit" section in README'. The patterns are tuned to phrases
+  # Claude Code actually emits, not generic word combinations.
   assert_no_match "$FIXTURES/no-limit.log"
 }

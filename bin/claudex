@@ -47,19 +47,21 @@ readonly TAIL_LINES=80
 
 mkdir -p "$LOG_DIR"
 
-# Patterns indicating Claude Pro/Max rate-limit. Explicit list to avoid
-# matching on generic words like "limit". All matched case-insensitively.
+# Patterns indicating Claude Pro/Max rate-limit. Tuned to avoid matching
+# generic occurrences of "rate limit" / "limit" / "reset" in unrelated tool
+# output. Each pattern below is a phrase Claude Code itself produces in the
+# rate-limit UI (verified against test/fixtures/). All matched case-
+# insensitively. When you see a NEW wording in the wild, add a fixture
+# under test/fixtures/ and an entry here.
 readonly LIMIT_PATTERNS=(
-  'rate.?limit'
   'rate-limit-options'
-  'usage limit'
-  'limit reached'
+  'out of extra usage'
+  'increase your usage limit'
+  'wait for limit to reset'
+  'usage limit reached'
   '5-hour limit'
-  'try again at'
-  'reset.*hours'
   'quota exceeded'
   'too many requests'
-  'out of extra usage'
 )
 
 # Build a single grep -E alternation

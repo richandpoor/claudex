@@ -1,7 +1,9 @@
-  ⎿  Configured user quota for project
-  ⎿  Token bucket initialized
+  ⎿  Set new connection rate limit to 100 req/sec
+  ⎿  The API has a rate-limit of 1000 calls/hour for free accounts
+  ⎿  Configured user quota for project (no limit set)
+  ⎿  Token bucket initialized; reset every 60 seconds
   ⎿  Successfully reset password for user account
   ⎿  Try restarting the service if the issue persists
   ⎿  Limit the search to recent files only
   ⎿  Reset complete; cache cleared in 12ms
-  ⎿  Quota check passed
+  ⎿  Documentation: see "rate limit" section in README

@@ -42,17 +42,13 @@ ln -sf "$PWD/bin/claudex"     ~/.local/bin/claudex
 
 ## Bootstrap (one-time)
 
-If you have never used multi-account, your `~/.claude/.credentials.json` is a regular file. Migrate it into the new layout:
+If you have never used multi-account, your `~/.claude/.credentials.json` is a regular file. Migrate it with:
 
 ```sh
-mkdir -p ~/.claude/accounts
-mv ~/.claude/.credentials.json ~/.claude/accounts/main.json
-chmod 600 ~/.claude/accounts/main.json
-ln -s accounts/main.json ~/.claude/.credentials.json
-echo main > ~/.claude/accounts/active
+claude-acct init main
 ```
 
-Replace `main` with whatever name you want for your first account. From now on `~/.claude/.credentials.json` must remain a symlink — `claude-acct` refuses to run otherwise (and tells you how to recover).
+Replace `main` with whatever name you want for your first account. The command moves `~/.claude/.credentials.json` into `accounts/main.json`, fixes permissions, and re-creates the symlink. From now on `~/.claude/.credentials.json` must remain a symlink — `claude-acct` refuses to run otherwise (and tells you how to recover).
 
 Add a second account interactively:
 
@@ -65,10 +61,12 @@ This backs up the current credentials, runs `claude auth logout` then `claude au
 ## Daily use
 
 ```sh
+claude-acct init main           # one-shot bootstrap from the legacy single-credential layout
 claude-acct list                # show all accounts, active marker, sub tier, email, reset countdown
+claude-acct list --json         # machine-readable output for status-line scripts
 claude-acct status              # active account + claude auth status
 claude-acct use work            # set 'work' active (swap symlink)
-claude-acct switch              # round-robin to the next account (alphabetical order)
+claude-acct switch              # round-robin to the next account, skipping ones still rate-limited
 claude-acct switch personal     # alias of 'use'
 claude-acct rm scratch          # delete an account (confirmation required)
 claude-acct mark-limit [<name>] # record a rate-limit timestamp now
@@ -77,6 +75,8 @@ claude-acct set-email <name> <addr> # pin the displayed email when auth status c
 claude-acct set-reset-at <name> <t> # wall-clock reset for the list display
 claude-acct help
 ```
+
+`switch` skips any account whose `last-limit` is less than 5 hours old (or whose `reset-at` is still in the future). When every other account is also limited it falls back to plain round-robin and prints a notice.
 
 `<t>` for `set-reset-at` is either a unix epoch or any string GNU `date -d` can parse, e.g. `'2026-05-04 20:30:00'` or `'+3 hours 39 minutes'`.
 
