@@ -1,2 +1,13 @@
 test/.bats/
 claudex-logs/
+
+# --- git-hourly-sync: secrets (non rimuovere) ---
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+*.pem
+*.key
+**/credentials.json
+# --- fine git-hourly-sync secrets ---
